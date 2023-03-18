@@ -1,7 +1,5 @@
-use bevy::ecs::{
-    schedule::IntoSystemDescriptor,
-    system::{Resource, SystemMeta, SystemParam, SystemParamFetch, SystemParamState},
-};
+use bevy::ecs::system::{Resource, SystemMeta, SystemParam};
+use bevy::window::PrimaryWindow;
 use bevy::{input::keyboard::KeyboardInput, prelude::*};
 use bevy_egui::egui::{epaint::text::cursor::CCursor, Color32, FontId, TextFormat};
 use bevy_egui::egui::{text::LayoutJob, text_edit::CCursorRange};
@@ -15,11 +13,10 @@ use std::collections::{BTreeMap, VecDeque};
 use std::marker::PhantomData;
 use std::mem;
 
-type ConsoleCommandEnteredReaderState =
-    <EventReader<'static, 'static, ConsoleCommandEntered> as SystemParam>::Fetch;
-
-type PrintConsoleLineWriterState =
-    <EventWriter<'static, 'static, PrintConsoleLine> as SystemParam>::Fetch;
+type ConsoleCommandEnteredReader = EventReader<'static, 'static, ConsoleCommandEntered>;
+type ConsoleCommandEnteredReaderState = <ConsoleCommandEnteredReader as SystemParam>::State;
+type PrintConsoleLineWriter = EventWriter<'static, PrintConsoleLine>;
+type PrintConsoleLineWriterState = <PrintConsoleLineWriter as SystemParam>::State;
 
 /// A super-trait for command like structures
 pub trait Command: NamedCommand + CommandFactory + FromArgMatches + Sized + Resource {}
@@ -59,7 +56,8 @@ pub trait NamedCommand {
 /// ```
 pub struct ConsoleCommand<'w, 's, T> {
     command: Option<Result<T, clap::Error>>,
-    console_line: EventWriter<'w, 's, PrintConsoleLine>,
+    console_line: EventWriter<'w, PrintConsoleLine>,
+    marker: std::marker::PhantomData<&'s T>,
 }
 
 impl<'w, 's, T> ConsoleCommand<'w, 's, T> {
@@ -106,51 +104,51 @@ impl<'w, 's, T> ConsoleCommand<'w, 's, T> {
     }
 }
 
-pub struct ConsoleCommandState<T> {
+pub struct ConsoleCommandState<'w, 's, T> {
     #[allow(clippy::type_complexity)]
     event_reader: ConsoleCommandEnteredReaderState,
     console_line: PrintConsoleLineWriterState,
-    marker: PhantomData<T>,
+    w_marker: PhantomData<&'w T>,
+    s_marker: PhantomData<&'s T>,
 }
 
-impl<'w, 's, T: Command> SystemParam for ConsoleCommand<'w, 's, T> {
-    type Fetch = ConsoleCommandState<T>;
-}
+unsafe impl<'w, 's, T: Command> SystemParam for ConsoleCommand<'w, 's, T> {
+    type State = ConsoleCommandState<'static, 'static, T>;
+    type Item<'iw, 'is> = ConsoleCommand<'iw, 'is, T>;
 
-unsafe impl<T: Resource> SystemParamState for ConsoleCommandState<T> {
-    fn init(world: &mut World, system_meta: &mut SystemMeta) -> Self {
-        let event_reader = ConsoleCommandEnteredReaderState::init(world, system_meta);
-        let console_line = PrintConsoleLineWriterState::init(world, system_meta);
+    fn init_state(world: &mut World, system_meta: &mut SystemMeta) -> Self::State {
+        let event_reader = ConsoleCommandEnteredReader::init_state(world, system_meta);
+        let console_line = PrintConsoleLineWriter::init_state(world, system_meta);
         ConsoleCommandState {
             event_reader,
             console_line,
-            marker: PhantomData::default(),
+            s_marker: PhantomData,
+            w_marker: PhantomData,
         }
     }
-}
-
-impl<'w, 's, T: Command> SystemParamFetch<'w, 's> for ConsoleCommandState<T> {
-    type Item = ConsoleCommand<'w, 's, T>;
-
     #[inline]
-    unsafe fn get_param(
-        state: &'s mut Self,
+    unsafe fn get_param<'pw, 'ps>(
+        state: &'ps mut Self::State,
         system_meta: &SystemMeta,
-        world: &'w World,
+        world: &'pw World,
         change_tick: u32,
-    ) -> Self::Item {
-        let mut event_reader = ConsoleCommandEnteredReaderState::get_param(
-            &mut state.event_reader,
-            system_meta,
-            world,
-            change_tick,
-        );
-        let mut console_line = PrintConsoleLineWriterState::get_param(
-            &mut state.console_line,
-            system_meta,
-            world,
-            change_tick,
-        );
+    ) -> Self::Item<'pw, 'ps> {
+        let mut event_reader = unsafe {
+            ConsoleCommandEnteredReader::get_param(
+                &mut state.event_reader,
+                system_meta,
+                world,
+                change_tick,
+            )
+        };
+        let mut console_line = unsafe {
+            PrintConsoleLineWriter::get_param(
+                &mut state.console_line,
+                system_meta,
+                world,
+                change_tick,
+            )
+        };
 
         let command = event_reader.iter().find_map(|command| {
             if T::name() == command.command_name {
@@ -179,6 +177,7 @@ impl<'w, 's, T: Command> SystemParamFetch<'w, 's> for ConsoleCommandState<T> {
         ConsoleCommand {
             command,
             console_line,
+            marker: PhantomData,
         }
     }
 }
@@ -275,14 +274,14 @@ pub trait AddConsoleCommand {
     /// ```
     fn add_console_command<T: Command, Params>(
         &mut self,
-        system: impl IntoSystemDescriptor<Params>,
+        system: impl IntoSystemAppConfig<Params>,
     ) -> &mut Self;
 }
 
 impl AddConsoleCommand for App {
     fn add_console_command<T: Command, Params>(
         &mut self,
-        system: impl IntoSystemDescriptor<Params>,
+        system: impl IntoSystemAppConfig<Params>,
     ) -> &mut Self {
         let sys = move |mut config: ResMut<ConsoleConfiguration>| {
             let command = T::command().no_binary_name(true);
@@ -328,7 +327,7 @@ impl Default for ConsoleState {
 }
 
 pub(crate) fn console_ui(
-    mut egui_context: ResMut<EguiContext>,
+    mut egui_context: Query<(&mut EguiContext, With<PrimaryWindow>)>,
     config: Res<ConsoleConfiguration>,
     mut keyboard_input_events: EventReader<KeyboardInput>,
     mut state: ResMut<ConsoleState>,
@@ -343,127 +342,135 @@ pub(crate) fn console_ui(
     }
 
     if console_open.open {
-        egui::Window::new("Console")
-            .collapsible(false)
-            .default_pos([config.left_pos, config.top_pos])
-            .default_size([config.width, config.height])
-            .resizable(true)
-            .show(egui_context.ctx_mut(), |ui| {
-                ui.vertical(|ui| {
-                    let scroll_height = ui.available_height() - 30.0;
+        if let Some((mut egui_context, _)) = egui_context.iter_mut().next() {
+            egui::Window::new("Console")
+                .collapsible(false)
+                .default_pos([config.left_pos, config.top_pos])
+                .default_size([config.width, config.height])
+                .resizable(true)
+                .show(egui_context.get_mut(), |ui| {
+                    ui.vertical(|ui| {
+                        let scroll_height = ui.available_height() - 30.0;
 
-                    // Scroll area
-                    ScrollArea::vertical()
-                        .auto_shrink([false, false])
-                        .stick_to_bottom(true)
-                        .max_height(scroll_height)
-                        .show(ui, |ui| {
-                            ui.vertical(|ui| {
-                                for line in &state.scrollback {
-                                    let mut text = LayoutJob::default();
+                        // Scroll area
+                        ScrollArea::vertical()
+                            .auto_shrink([false, false])
+                            .stick_to_bottom(true)
+                            .max_height(scroll_height)
+                            .show(ui, |ui| {
+                                ui.vertical(|ui| {
+                                    for line in &state.scrollback {
+                                        let mut text = LayoutJob::default();
 
-                                    text.append(
-                                        &line.to_string(), //TOOD: once clap supports custom styling use it here
-                                        0f32,
-                                        TextFormat::simple(FontId::monospace(14f32), Color32::GRAY),
-                                    );
+                                        text.append(
+                                            &line.to_string(), //TOOD: once clap supports custom styling use it here
+                                            0f32,
+                                            TextFormat::simple(
+                                                FontId::monospace(14f32),
+                                                Color32::GRAY,
+                                            ),
+                                        );
 
-                                    ui.label(text);
+                                        ui.label(text);
+                                    }
+                                });
+
+                                // Scroll to bottom if console just opened
+                                if console_open.is_changed() {
+                                    ui.scroll_to_cursor(Some(Align::BOTTOM));
                                 }
                             });
 
-                            // Scroll to bottom if console just opened
-                            if console_open.is_changed() {
-                                ui.scroll_to_cursor(Some(Align::BOTTOM));
-                            }
-                        });
+                        // Separator
+                        ui.separator();
 
-                    // Separator
-                    ui.separator();
+                        // Input
+                        let text_edit = TextEdit::singleline(&mut state.buf)
+                            .desired_width(f32::INFINITY)
+                            .lock_focus(true)
+                            .font(egui::TextStyle::Monospace);
 
-                    // Input
-                    let text_edit = TextEdit::singleline(&mut state.buf)
-                        .desired_width(f32::INFINITY)
-                        .lock_focus(true)
-                        .font(egui::TextStyle::Monospace);
+                        // Handle enter
+                        let text_edit_response = ui.add(text_edit);
+                        if text_edit_response.lost_focus()
+                            && ui.input(|input| input.key_pressed(egui::Key::Enter))
+                        {
+                            if state.buf.trim().is_empty() {
+                                state.scrollback.push(StyledStr::new());
+                            } else {
+                                let msg = format!("{}{}", config.symbol, state.buf);
+                                state.scrollback.push(msg.into());
+                                let cmd_string = state.buf.clone();
+                                state.history.insert(1, cmd_string.into());
+                                if state.history.len() > config.history_size + 1 {
+                                    state.history.pop_back();
+                                }
 
-                    // Handle enter
-                    let text_edit_response = ui.add(text_edit);
-                    if text_edit_response.lost_focus() && ui.input().key_pressed(egui::Key::Enter) {
-                        if state.buf.trim().is_empty() {
-                            state.scrollback.push(StyledStr::new());
-                        } else {
-                            let msg = format!("{}{}", config.symbol, state.buf);
-                            state.scrollback.push(msg.into());
-                            let cmd_string = state.buf.clone();
-                            state.history.insert(1, cmd_string.into());
-                            if state.history.len() > config.history_size + 1 {
-                                state.history.pop_back();
-                            }
+                                let mut raw_input = state
+                                    .buf
+                                    .split_ascii_whitespace()
+                                    .map(ToOwned::to_owned)
+                                    .collect::<Vec<_>>();
 
-                            let mut raw_input = state
-                                .buf
-                                .split_ascii_whitespace()
-                                .map(ToOwned::to_owned)
-                                .collect::<Vec<_>>();
-
-                            if !raw_input.is_empty() {
-                                let command_name = raw_input.remove(0);
-                                debug!(
+                                if !raw_input.is_empty() {
+                                    let command_name = raw_input.remove(0);
+                                    debug!(
                                     "Command entered: `{command_name}`, with args: `{raw_input:?}`"
                                 );
 
-                                let command = config.commands.get(command_name.as_str());
+                                    let command = config.commands.get(command_name.as_str());
 
-                                if command.is_some() {
-                                    command_entered.send(ConsoleCommandEntered {
-                                        command_name,
-                                        args: raw_input,
-                                    });
-                                } else {
-                                    debug!(
-                                        "Command not recognized, recognized commands: `{:?}`",
-                                        config.commands.keys().collect::<Vec<_>>()
-                                    );
+                                    if command.is_some() {
+                                        command_entered.send(ConsoleCommandEntered {
+                                            command_name,
+                                            args: raw_input,
+                                        });
+                                    } else {
+                                        debug!(
+                                            "Command not recognized, recognized commands: `{:?}`",
+                                            config.commands.keys().collect::<Vec<_>>()
+                                        );
 
-                                    state.scrollback.push("error: Invalid command".into());
+                                        state.scrollback.push("error: Invalid command".into());
+                                    }
                                 }
+
+                                state.buf.clear();
+                            }
+                        }
+
+                        // Handle up and down through history
+                        if text_edit_response.has_focus()
+                            && ui.input(|input| input.key_pressed(egui::Key::ArrowUp))
+                            && state.history.len() > 1
+                            && state.history_index < state.history.len() - 1
+                        {
+                            if state.history_index == 0 && !state.buf.trim().is_empty() {
+                                *state.history.get_mut(0).unwrap() = state.buf.clone().into();
                             }
 
-                            state.buf.clear();
+                            state.history_index += 1;
+                            let previous_item =
+                                state.history.get(state.history_index).unwrap().clone();
+                            state.buf = previous_item.to_string();
+
+                            set_cursor_pos(ui.ctx(), text_edit_response.id, state.buf.len());
+                        } else if text_edit_response.has_focus()
+                            && ui.input(|input| input.key_pressed(egui::Key::ArrowDown))
+                            && state.history_index > 0
+                        {
+                            state.history_index -= 1;
+                            let next_item = state.history.get(state.history_index).unwrap().clone();
+                            state.buf = next_item.to_string();
+
+                            set_cursor_pos(ui.ctx(), text_edit_response.id, state.buf.len());
                         }
-                    }
 
-                    // Handle up and down through history
-                    if text_edit_response.has_focus()
-                        && ui.input().key_pressed(egui::Key::ArrowUp)
-                        && state.history.len() > 1
-                        && state.history_index < state.history.len() - 1
-                    {
-                        if state.history_index == 0 && !state.buf.trim().is_empty() {
-                            *state.history.get_mut(0).unwrap() = state.buf.clone().into();
-                        }
-
-                        state.history_index += 1;
-                        let previous_item = state.history.get(state.history_index).unwrap().clone();
-                        state.buf = previous_item.to_string();
-
-                        set_cursor_pos(ui.ctx(), text_edit_response.id, state.buf.len());
-                    } else if text_edit_response.has_focus()
-                        && ui.input().key_pressed(egui::Key::ArrowDown)
-                        && state.history_index > 0
-                    {
-                        state.history_index -= 1;
-                        let next_item = state.history.get(state.history_index).unwrap().clone();
-                        state.buf = next_item.to_string();
-
-                        set_cursor_pos(ui.ctx(), text_edit_response.id, state.buf.len());
-                    }
-
-                    // Focus on input
-                    ui.memory().request_focus(text_edit_response.id);
+                        // Focus on input
+                        ui.memory_mut(|memory| memory.request_focus(text_edit_response.id));
+                    });
                 });
-            });
+        }
     }
 }
 

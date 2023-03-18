@@ -1,9 +1,9 @@
 #![doc = include_str ! ("../README.md")]
 #![deny(missing_docs)]
 
-use bevy::prelude::{App, IntoSystemDescriptor, Plugin};
+use bevy::prelude::{App, Plugin};
 pub use bevy_console_derive::ConsoleCommand;
-use bevy_egui::{EguiContext, EguiPlugin};
+use bevy_egui::{EguiPlugin, EguiSettings};
 
 use crate::commands::clear::{clear_command, ClearCommand};
 use crate::commands::exit::{exit_command, ExitCommand};
@@ -34,12 +34,12 @@ impl Plugin for ConsolePlugin {
             .add_console_command::<ClearCommand, _>(clear_command)
             .add_console_command::<ExitCommand, _>(exit_command)
             .add_console_command::<HelpCommand, _>(help_command)
-            .add_system(console_ui.at_end())
+            .add_system(console_ui)
             .add_system(receive_console_line);
 
         // Don't create an egui context if one already exists.
         // This can happen if another plugin is using egui and was installed before us.
-        if !app.world.contains_resource::<EguiContext>() {
+        if !app.world.contains_resource::<EguiSettings>() {
             app.add_plugin(EguiPlugin);
         }
     }
